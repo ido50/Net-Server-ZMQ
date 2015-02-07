@@ -1,0 +1,197 @@
+NAME
+    Net::Server::ZMQ - Preforking ZeroMQ job server
+
+SYNOPSIS
+            use Net::Server::ZMQ;
+
+            Net::Server::ZMQ->run(
+                    port => [6660, 6661],   # [frontend port, backend port]
+                    min_servers => 5,
+                    max_servers => 10,
+                    app => sub {
+                            my $payload = shift;
+
+                            return uc($payload);
+                    }
+            );
+
+DESCRIPTION
+    "Net::Server::ZMQ" is a Net::Server personality based on
+    Net::Server::PreFork, providing an easy way of creating a preforking
+    ZeroMQ job server. It uses ZMQ::FFI for ZeroMQ integration, independent
+    of the installed "libzmq" version. You will need to have "libffi"
+    installed.
+
+    This personality implements the "Extended Request-Reply" pattern
+    described in the ZeroMQ guide <http://zguide.zeromq.org/page:all>. It
+    creates a "ROUTER"/"DEALER" broker in the parent process, and one or
+    more child processes as "REP" workers. "REQ" clients can send requests
+    to those workers through the broker, which balances requests across the
+    workers in a non-blocking way.
+
+    You get the full benefits of "Net::Server::PreFork", including the
+    ability to increase or decrease the number of workers by sending the
+    "TTIN" and "TTOU" signals to the server, respectively.
+
+  INTERNAL NOTES
+    ZeroMQ has some different concepts regarding sockets, and as such this
+    class overrides the binding done by "Net::Server" so they do nothing
+    ("pre_bind()" and "bind()" are emptied). Also, since ZeroMQ never
+    exposes client information to request handlers, it is possible for
+    "Net::Server::ZMQ" to provide workers with data such as the IP address
+    of the client, and the "get_client_info()" method is empties as well.
+    Supplying client information should therefore be done applicatively. The
+    "allow_deny()" method is also overridden to always return true, for the
+    same reason, though I'm not so certain yet whether a better solution can
+    be implemented.
+
+  CLIENT EXAMPLE
+    This is a simple client that sends a message to the server and prints
+    out the response:
+
+            use ZMQ::FFI;
+            use ZMQ::FFI::Constants qw/ZMQ_REQ/;
+
+            my $ctx = ZMQ::FFI->new;
+            my $s = $ctx->socket(ZMQ_REQ);
+            $s->connect('tcp://localhost:6660');
+
+            $s->send('my name is nobody');
+
+            print $s->recv, "\n";
+
+OVERRIDDEN METHODS
+  pre_bind()
+  bind()
+  post_bind()
+    Emptied out
+
+  options()
+    Adds the custom "app" option to "Net::Server". It takes the subroutine
+    reference that handles requests, i.e. the worker subroutine.
+
+  post_configure()
+    Validates the "app" option and provides a useless default (a worker
+    subroutine that simply echos back what the client sends).
+
+  run_parent()
+    Creates the broker process, binding a "ROUTER" on the frontend port
+    (facing clients), and "DEALER" on the backend port (facing workers).
+
+    It then creates a "QUEUE" proxy between the two ports.
+
+    The parent process will receive the proctitle "zmq broker
+    <fport>-<bport>", where "<fport> is the frontend port and "<bport>" is
+    the backend port.
+
+  child_init_hook()
+    This hook binds a "REP" socket on the backend port, through which
+    workers communicate with the broker. Every child process receives the
+    proctitle "zmq worker <bport>", where "<bport>" is the backend port.
+
+  accept()
+    Waits for new messages from clients. When a message is received, it is
+    stored as the "payload" attribute, with the socket stored as the
+    "client" attribute.
+
+  post_accept()
+  get_client_info()
+    Emptied out
+
+  allow_deny()
+    Simply returns a true value
+
+  process_request()
+    Calls the "app" (i.e. worker subroutine) with the payload from the
+    client, and sends the result back to the client.
+
+  post_process_request()
+    Removes the "client" attribute (holding the "REP" socket) at the end of
+    the request.
+
+  sig_hup()
+    Overridden to simply send "SIGHUP" to the children (to restart them),
+    and that's it
+
+  shutdown_sockets()
+    Closes the ZeroMQ sockets
+
+  child_finish_hook()
+    Closes the children's socket and destroys the context (this is
+    necessary, otherwise we'll have zombies).
+
+CONFIGURATION AND ENVIRONMENT
+    Read Net::Server for more information about configuration.
+
+DEPENDENCIES
+    "Net::Server::ZMQ" depends on the following CPAN modules:
+
+    *   Carp
+
+    *   Net::Server::PreFork
+
+    *   ZMQ::FFI
+
+BUGS AND LIMITATIONS
+    Please report any bugs or feature requests to
+    "bug-Net-Server-ZMQ@rt.cpan.org", or through the web interface at
+    <http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Net-Server-ZMQ>.
+
+SUPPORT
+    You can find documentation for this module with the perldoc command.
+
+            perldoc Net::Server::ZMQ
+
+    You can also look for information at:
+
+    *   RT: CPAN's request tracker
+
+        <http://rt.cpan.org/NoAuth/Bugs.html?Dist=Net-Server-ZMQ>
+
+    *   AnnoCPAN: Annotated CPAN documentation
+
+        <http://annocpan.org/dist/Net-Server-ZMQ>
+
+    *   CPAN Ratings
+
+        <http://cpanratings.perl.org/d/Net-Server-ZMQ>
+
+    *   Search CPAN
+
+        <http://search.cpan.org/dist/Net-Server-ZMQ/>
+
+AUTHOR
+    Ido Perlmuter <ido@ido50.net>
+
+LICENSE AND COPYRIGHT
+    Copyright (c) 2015, Ido Perlmuter "ido@ido50.net".
+
+    This module is free software; you can redistribute it and/or modify it
+    under the same terms as Perl itself, either version 5.8.1 or any later
+    version. See perlartistic and perlgpl.
+
+    The full text of the license can be found in the LICENSE file included
+    with this module.
+
+DISCLAIMER OF WARRANTY
+    BECAUSE THIS SOFTWARE IS LICENSED FREE OF CHARGE, THERE IS NO WARRANTY
+    FOR THE SOFTWARE, TO THE EXTENT PERMITTED BY APPLICABLE LAW. EXCEPT WHEN
+    OTHERWISE STATED IN WRITING THE COPYRIGHT HOLDERS AND/OR OTHER PARTIES
+    PROVIDE THE SOFTWARE "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER
+    EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+    WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. THE
+    ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE SOFTWARE IS WITH
+    YOU. SHOULD THE SOFTWARE PROVE DEFECTIVE, YOU ASSUME THE COST OF ALL
+    NECESSARY SERVICING, REPAIR, OR CORRECTION.
+
+    IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+    WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MAY MODIFY AND/OR
+    REDISTRIBUTE THE SOFTWARE AS PERMITTED BY THE ABOVE LICENCE, BE LIABLE
+    TO YOU FOR DAMAGES, INCLUDING ANY GENERAL, SPECIAL, INCIDENTAL, OR
+    CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE THE
+    SOFTWARE (INCLUDING BUT NOT LIMITED TO LOSS OF DATA OR DATA BEING
+    RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD PARTIES OR A
+    FAILURE OF THE SOFTWARE TO OPERATE WITH ANY OTHER SOFTWARE), EVEN IF
+    SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+    DAMAGES.
+
