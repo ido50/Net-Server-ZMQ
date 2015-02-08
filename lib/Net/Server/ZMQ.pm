@@ -5,12 +5,13 @@ package Net::Server::ZMQ;
 use warnings;
 use strict;
 use base 'Net::Server::PreFork';
+use constant READY => "\001";
 
 use Carp;
 use POSIX qw/WNOHANG/;
 use Net::Server::SIG qw/register_sig check_sigs/;
 use ZMQ::FFI;
-use ZMQ::FFI::Constants qw/ZMQ_DEALER ZMQ_ROUTER ZMQ_REP ZMQ_QUEUE/;
+use ZMQ::FFI::Constants qw/ZMQ_ROUTER ZMQ_REQ/;
 
 our $VERSION = "1.000000";
 $VERSION = eval $VERSION;
@@ -133,6 +134,9 @@ sub post_configure {
 
 	confess "app must be a subroutine reference"
 		unless ref $prop->{app} && ref $prop->{app} eq 'CODE';
+
+	confess "port must contain a frontend port and a backend port"
+		unless ref $prop->{port} && ref $prop->{port} eq 'ARRAY' && scalar @{$prop->{port}} >= 2;
 }
 
 =head2 run_parent()
@@ -194,19 +198,24 @@ sub run_parent {
 	my $ctx = ZMQ::FFI->new;
 
 	my $f = $ctx->socket(ZMQ_ROUTER);
+	$f->set_linger(0);
 	$f->bind('tcp://*:'.$fport);
 
-	my $b = $ctx->socket(ZMQ_DEALER);
+	my $b = $ctx->socket(ZMQ_ROUTER);
+	$b->set_linger(0);
 	$b->bind('tcp://*:'.$bport);
 
+	my (@workers, $w_addr, $delim, $c_addr, $data);
 	while (1) {
 		check_sigs();
 
 		$self->idle_loop_hook;
 
-		if ($f->has_pollin) {
+		# poll on the frontend or the backend, but only poll
+		# on the frontend if there are workers
+		if (scalar @workers && $f->has_pollin) {
 			my @msg = $f->recv_multipart;
-			$b->send_multipart(\@msg);
+			$b->send_multipart([ pop(@workers), '', $msg[0], '', $msg[2] ]);
 		} elsif ($b->has_pollin) {
 			my @fh = $prop->{'child_select'}->can_read($prop->{'check_for_waiting'});
 
@@ -244,10 +253,29 @@ sub run_parent {
 			}
 
 			my @msg = $b->recv_multipart;
-			$f->send_multipart(\@msg);
+
+			$w_addr = $msg[0];
+			push(@workers, $w_addr);
+
+			$delim = $msg[1];
+			$c_addr = $msg[2];
+
+			if ($c_addr ne READY) {
+				$delim = $msg[3];
+
+				$data = $msg[4];
+
+				$self->log(4, "$w_addr sending to $c_addr: $data");
+
+				$f->send_multipart([ $c_addr, '', $data ]);
+			} else {
+				$self->log(3, "$w_addr checking in");
+			}
 
 			$self->coordinate_children();
 		}
+
+		#select undef, undef, undef, 0.025;
 	}
 }
 
@@ -268,10 +296,15 @@ sub child_init_hook {
 	$0 = "zmq worker $port";
 
 	my $ctx = ZMQ::FFI->new;
-	my $socket = $ctx->socket(ZMQ_REP);
-	$socket->connect("tcp://localhost:$port");
+	my $s = $ctx->socket(ZMQ_REQ);
+	$s->set_identity("child_$$");
+	$s->set_linger(0);
 
-	$prop->{sock} = [$socket];
+	$s->connect("tcp://localhost:$port");
+
+	$s->send(READY);
+
+	$prop->{sock} = [$s];
 	$prop->{context} = $ctx;
 }
 
@@ -295,11 +328,13 @@ sub accept {
 	while (1) {
 		next unless $sock->has_pollin;
 
-		my $msg = $sock->recv;
+		my @msg = $sock->recv_multipart;
 
-		$prop->{client} = $sock;
+		$self->log(4, $sock->get_identity." got: $msg[2]");
 
-		$prop->{payload} = $msg;
+		$prop->{client}	= $sock;
+		$prop->{peername}	= $msg[0];
+		$prop->{payload}	= $msg[2];
 
 		return 1;
 	}
@@ -336,9 +371,11 @@ sub process_request {
 	my $self = shift;
 	my $prop = $self->{server};
 
-	$prop->{client}->send(
+	$prop->{client}->send_multipart([
+		$prop->{peername},
+		'',
 		$prop->{app}->($prop->{payload})
-	);
+	]);
 }
 
 =head2 post_process_request()
@@ -452,6 +489,10 @@ L<http://search.cpan.org/dist/Net-Server-ZMQ/>
 =head1 AUTHOR
  
 Ido Perlmuter <ido@ido50.net>
+
+=head1 ACKNOWLEDGMENTS
+
+In writing this module I relied heavily on L<Starman> by Tatsuhiko Miyagawa.
  
 =head1 LICENSE AND COPYRIGHT
  
