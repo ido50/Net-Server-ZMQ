@@ -12,7 +12,7 @@ use Net::Server::SIG qw/register_sig check_sigs/;
 use ZMQ::FFI;
 use ZMQ::FFI::Constants qw/ZMQ_ROUTER ZMQ_DEALER/;
 
-our $VERSION = "0.001000";
+our $VERSION = "0.001001";
 $VERSION = eval $VERSION;
 
 =head1 NAME

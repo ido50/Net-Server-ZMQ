@@ -1,6 +1,5 @@
 #!/usr/bin/env perl
 
-use local::lib './extlib';
 use warnings;
 use strict;
 
