@@ -12,7 +12,7 @@ use Net::Server::SIG qw/register_sig check_sigs/;
 use ZMQ::FFI;
 use ZMQ::FFI::Constants qw/ZMQ_ROUTER ZMQ_DEALER/;
 
-our $VERSION = "1.000000";
+our $VERSION = "0.001000";
 $VERSION = eval $VERSION;
 
 =head1 NAME
@@ -27,7 +27,7 @@ Net::Server::ZMQ - Preforking ZeroMQ job server
 		port => [6660, 6661],	# [frontend port, backend port]
 		min_servers => 5,
 		max_servers => 10,
-		app => sub {
+		app => sub {		# this is your worker code
 			my $payload = shift;
 
 			return uc($payload);
@@ -41,41 +41,83 @@ providing an easy way of creating a preforking ZeroMQ job server. It uses L<ZMQ:
 for ZeroMQ integration, independent of the installed C<libzmq> version. You will need
 to have C<libffi> installed.
 
-This personality implements the "Extended Request-Reply" pattern described in the
-L<ZeroMQ guide|http://zguide.zeromq.org/page:all>. It creates a C<ROUTER>/C<DEALER>
-broker in the parent process, and one or more child processes as C<REP> workers.
-C<REQ> clients can send requests to those workers through the broker, which balances
-requests across the workers in a non-blocking way.
+Currently, this personality implements the load balancing "simple pirate" pattern
+described in the L<ZeroMQ guide|http://zguide.zeromq.org/page:all>. The server creates
+a C<ROUTER>-to-C<ROUTER> broker in the parent process, and one or more child processes
+as C<DEALER> workers. Multiple C<REQ> clients can send requests to those workers through
+the broker, which operates in a non-blocking way and balances requests across the workers.
+
+The created topology looks like this:
+
+	+--------+     +--------+     +--------+
+	| CLIENT |     | CLIENT |     | CLIENT |
+	+--------+     +--------+     +--------+
+	|  REQ   |     |  REQ   |     |  REQ   |
+	+---+----+     +---+----+     +---+----+
+	    |              |              |
+	    |______________|______________|
+	                   |
+	                   |
+	               +---+----+
+	               | ROUTER |
+	               +--------+
+	               | BROKER |
+	               +--------+
+	               | ROUTER |
+	               +---+----|
+	                   |
+	      _____________|_____________
+	     |             |             |
+	     |             |             |
+	+----+---+    +----+---+    +----+---+
+	| DEALER |    | DEALER |    | DEALER |
+	+--------+    +--------+    +--------+
+	| WORKER |    | WORKER |    | WORKER |
+	+--------+    +--------+    +--------+
 
 You get the full benefits of C<Net::Server::PreFork>, including the ability to increase
-or decrease the number of workers by sending the C<TTIN> and C<TTOU> signals to the server,
-respectively.
+or decrease the number of workers at real-time by sending the C<TTIN> and C<TTOU> signals
+to the server, respectively.
+
+This is an early release, do not rely on it on production systems without thoroughly testing
+it beforehand.
+
+I plan to implement better reliability as described in the ZeroMQ guide in future versions,
+and also add support for different patterns such as publish-subscribe.
+
+The ZMQ server does not care about the format of messages passed between clients and workers,
+this kind of logic is left to the applications. You can easily implement a JSON-based job broker,
+for example, either by taking care of encoding/decoding in the worker code, or by extending this
+class and overriding C<process_request()>.
+
+Note that configuration of a ZMQ server requires two ports, one for the frontend (the port to
+which clients connect), and one for the backend (the port to which workers connect).
 
 =head2 INTERNAL NOTES
 
 ZeroMQ has some different concepts regarding sockets, and as such this class overrides
-the binding done by C<Net::Server> so they do nothing (C<pre_bind()> and C<bind()> are
-emptied). Also, since ZeroMQ never exposes client information to request handlers, it
-is possible for C<Net::Server::ZMQ> to provide workers with data such as the IP address
-of the client, and the C<get_client_info()> method is empties as well. Supplying client
+the bindings done by C<Net::Server> so they do nothing (C<pre_bind()>, C<bind()> and
+C<post_bind()> are emptied). Also, since ZeroMQ never exposes client information to request
+handlers, it is possible for C<Net::Server::ZMQ> to provide workers with data such as the
+IP address of the client, and the C<get_client_info()> method is empties as well. Supplying client
 information should therefore be done applicatively. The C<allow_deny()> method is also
 overridden to always return true, for the same reason, though I'm not so certain yet
 whether a better solution can be implemented.
 
-=head2 CLIENT EXAMPLE
+Unfortunately, I did have to override quite a few methods I really didn't want to, such
+as C<loop()>, C<run_n_children()>, C<run_child()> and C<delete_child()>, mostly to get
+rid of any traditional socket communication between the child and parent processes and
+replace it was ZeroMQ communication.
 
-This is a simple client that sends a message to the server and prints out the response:
+=head2 CLIENT IMPLEMENTATION
 
-	use ZMQ::FFI;
-	use ZMQ::FFI::Constants qw/ZMQ_REQ/;
+Clients should be implemented according to the L<lazy pirate client|http://zguide.zeromq.org/pl:lpclient>
+in the ZeroMQ guide. Clients I<MUST> define a unique identity on their sockets when communicating
+with the broker, otherwise the broker will not be able to direct responses from the workers back
+to the correct client.
 
-	my $ctx = ZMQ::FFI->new;
-	my $s = $ctx->socket(ZMQ_REQ);
-	$s->connect('tcp://localhost:6660');
-
-	$s->send('my name is nobody');
-
-	print $s->recv, "\n";
+A client implementation, L<zmq-client>, is provided with this distribution to get up and running as
+quickly as possible.
 
 =head1 OVERRIDDEN METHODS
 
@@ -115,7 +157,8 @@ sub options {
 =head2 post_configure()
 
 Validates the C<app> option and provides a useless default (a worker
-subroutine that simply echos back what the client sends).
+subroutine that simply echos back what the client sends). Validates
+the C<port> option, and sets default values for C<user> and C<group>.
 
 =cut
 
@@ -137,6 +180,12 @@ sub post_configure {
 	confess "port must contain a frontend port and a backend port"
 		unless ref $prop->{port} && ref $prop->{port} eq 'ARRAY' && scalar @{$prop->{port}} >= 2;
 }
+
+=head2 loop()
+
+Overrides the main loop subroutine to remove pipe creation.
+
+=cut
 
 sub loop {
 	my $self = shift;
@@ -167,9 +216,10 @@ sub loop {
 =head2 run_parent()
 
 Creates the broker process, binding a C<ROUTER> on the frontend port
-(facing clients), and C<DEALER> on the backend port (facing workers).
+(facing clients), and C<ROUTER> on the backend port (facing workers).
 
-It then creates a C<QUEUE> proxy between the two ports.
+It then starts polling on both sockets for events and passes messages
+between clients and workers.
 
 The parent process will receive the proctitle "zmq broker <fport>-<bport>",
 where "<fport> is the frontend port and "<bport>" is the backend port.
@@ -245,6 +295,8 @@ sub run_parent {
 				my ($pid) = ($w_addr =~ m/^child_(\d+)$/);
 				my $status = $c_addr;
 
+				last if $self->parent_read_hook($c_addr);
+
 				push(@workers, $w_addr)
 					if $status eq 'waiting';
 
@@ -269,18 +321,23 @@ sub run_parent {
 					}
 				}
 			} else {
+				last if $self->parent_read_hook($msg[4]);
+
 				$self->log(4, "$w_addr sending to $c_addr: $msg[4]");
 				$f->send_multipart([ $c_addr, '', $msg[4] ]);
 			}
 
-			#last if $self->parent_read_hook($c_addr); # optional test by user hook
-
 			$self->coordinate_children();
 		}
-
-		#select undef, undef, undef, 0.025;
 	}
 }
+
+=head2 run_n_children( $n )
+
+The same as in C<Net::Server::PreFork>, with all socket communication
+code removed.
+
+=cut
 
 sub run_n_children {
 	my ($self, $n) = @_;
@@ -311,6 +368,16 @@ sub run_n_children {
 		}
 	}
 }
+
+=head2 run_child()
+
+Creates a C<DEALER> socket between workers and server. Every child
+process with get a proctitle of "zmq worker <bport>", where "<bport>"
+is the backend port.
+
+The child then signals the server that it is ready, and waits for requests.
+
+=cut
 
 sub run_child {
 	my $self = shift;
@@ -502,6 +569,12 @@ sub child_finish_hook {
 	};
 }
 
+=head2 delete_child( $pid )
+
+Overridden to remove dealing with sockets.
+
+=cut
+
 sub delete_child {
 	my ($self, $pid) = @_;
 	my $prop = $self->{server};
@@ -533,7 +606,11 @@ C<Net::Server::ZMQ> depends on the following CPAN modules:
 
 =item * L<Carp>
 
+=item * L<Getopt::Long>
+
 =item * L<Net::Server::PreFork>
+
+=item * L<Pod::Usage>
 
 =item * L<ZMQ::FFI>
 
@@ -579,7 +656,8 @@ Ido Perlmuter <ido@ido50.net>
 
 =head1 ACKNOWLEDGMENTS
 
-In writing this module I relied heavily on L<Starman> by Tatsuhiko Miyagawa.
+In writing this module I relied heavily on L<Starman> by Tatsuhiko Miyagawa, and
+on code and information from the official L<ZeroMQ guide|http://zguide.zeromq.org/>.
  
 =head1 LICENSE AND COPYRIGHT
  

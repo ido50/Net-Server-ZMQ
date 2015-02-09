@@ -8,7 +8,7 @@ SYNOPSIS
                     port => [6660, 6661],   # [frontend port, backend port]
                     min_servers => 5,
                     max_servers => 10,
-                    app => sub {
+                    app => sub {            # this is your worker code
                             my $payload = shift;
 
                             return uc($payload);
@@ -22,43 +22,90 @@ DESCRIPTION
     of the installed "libzmq" version. You will need to have "libffi"
     installed.
 
-    This personality implements the "Extended Request-Reply" pattern
-    described in the ZeroMQ guide <http://zguide.zeromq.org/page:all>. It
-    creates a "ROUTER"/"DEALER" broker in the parent process, and one or
-    more child processes as "REP" workers. "REQ" clients can send requests
-    to those workers through the broker, which balances requests across the
-    workers in a non-blocking way.
+    Currently, this personality implements the load balancing "simple
+    pirate" pattern described in the ZeroMQ guide
+    <http://zguide.zeromq.org/page:all>. The server creates a
+    "ROUTER"-to-"ROUTER" broker in the parent process, and one or more child
+    processes as "DEALER" workers. Multiple "REQ" clients can send requests
+    to those workers through the broker, which operates in a non-blocking
+    way and balances requests across the workers.
+
+    The created topology looks like this:
+
+            +--------+     +--------+     +--------+
+            | CLIENT |     | CLIENT |     | CLIENT |
+            +--------+     +--------+     +--------+
+            |  REQ   |     |  REQ   |     |  REQ   |
+            +---+----+     +---+----+     +---+----+
+                |              |              |
+                |______________|______________|
+                               |
+                               |
+                           +---+----+
+                           | ROUTER |
+                           +--------+
+                           | BROKER |
+                           +--------+
+                           | ROUTER |
+                           +---+----|
+                               |
+                  _____________|_____________
+                 |             |             |
+                 |             |             |
+            +----+---+    +----+---+    +----+---+
+            | DEALER |    | DEALER |    | DEALER |
+            +--------+    +--------+    +--------+
+            | WORKER |    | WORKER |    | WORKER |
+            +--------+    +--------+    +--------+
 
     You get the full benefits of "Net::Server::PreFork", including the
-    ability to increase or decrease the number of workers by sending the
-    "TTIN" and "TTOU" signals to the server, respectively.
+    ability to increase or decrease the number of workers at real-time by
+    sending the "TTIN" and "TTOU" signals to the server, respectively.
+
+    This is an early release, do not rely on it on production systems
+    without thoroughly testing it beforehand.
+
+    I plan to implement better reliability as described in the ZeroMQ guide
+    in future versions, and also add support for different patterns such as
+    publish-subscribe.
+
+    The ZMQ server does not care about the format of messages passed between
+    clients and workers, this kind of logic is left to the applications. You
+    can easily implement a JSON-based job broker, for example, either by
+    taking care of encoding/decoding in the worker code, or by extending
+    this class and overriding "process_request()".
+
+    Note that configuration of a ZMQ server requires two ports, one for the
+    frontend (the port to which clients connect), and one for the backend
+    (the port to which workers connect).
 
   INTERNAL NOTES
     ZeroMQ has some different concepts regarding sockets, and as such this
-    class overrides the binding done by "Net::Server" so they do nothing
-    ("pre_bind()" and "bind()" are emptied). Also, since ZeroMQ never
-    exposes client information to request handlers, it is possible for
-    "Net::Server::ZMQ" to provide workers with data such as the IP address
-    of the client, and the "get_client_info()" method is empties as well.
-    Supplying client information should therefore be done applicatively. The
-    "allow_deny()" method is also overridden to always return true, for the
-    same reason, though I'm not so certain yet whether a better solution can
-    be implemented.
+    class overrides the bindings done by "Net::Server" so they do nothing
+    ("pre_bind()", "bind()" and "post_bind()" are emptied). Also, since
+    ZeroMQ never exposes client information to request handlers, it is
+    possible for "Net::Server::ZMQ" to provide workers with data such as the
+    IP address of the client, and the "get_client_info()" method is empties
+    as well. Supplying client information should therefore be done
+    applicatively. The "allow_deny()" method is also overridden to always
+    return true, for the same reason, though I'm not so certain yet whether
+    a better solution can be implemented.
 
-  CLIENT EXAMPLE
-    This is a simple client that sends a message to the server and prints
-    out the response:
+    Unfortunately, I did have to override quite a few methods I really
+    didn't want to, such as "loop()", "run_n_children()", "run_child()" and
+    "delete_child()", mostly to get rid of any traditional socket
+    communication between the child and parent processes and replace it was
+    ZeroMQ communication.
 
-            use ZMQ::FFI;
-            use ZMQ::FFI::Constants qw/ZMQ_REQ/;
+  CLIENT IMPLEMENTATION
+    Clients should be implemented according to the lazy pirate client
+    <http://zguide.zeromq.org/pl:lpclient> in the ZeroMQ guide. Clients
+    *MUST* define a unique identity on their sockets when communicating with
+    the broker, otherwise the broker will not be able to direct responses
+    from the workers back to the correct client.
 
-            my $ctx = ZMQ::FFI->new;
-            my $s = $ctx->socket(ZMQ_REQ);
-            $s->connect('tcp://localhost:6660');
-
-            $s->send('my name is nobody');
-
-            print $s->recv, "\n";
+    A client implementation, zmq-client, is provided with this distribution
+    to get up and running as quickly as possible.
 
 OVERRIDDEN METHODS
   pre_bind()
@@ -72,22 +119,34 @@ OVERRIDDEN METHODS
 
   post_configure()
     Validates the "app" option and provides a useless default (a worker
-    subroutine that simply echos back what the client sends).
+    subroutine that simply echos back what the client sends). Validates the
+    "port" option, and sets default values for "user" and "group".
+
+  loop()
+    Overrides the main loop subroutine to remove pipe creation.
 
   run_parent()
     Creates the broker process, binding a "ROUTER" on the frontend port
-    (facing clients), and "DEALER" on the backend port (facing workers).
+    (facing clients), and "ROUTER" on the backend port (facing workers).
 
-    It then creates a "QUEUE" proxy between the two ports.
+    It then starts polling on both sockets for events and passes messages
+    between clients and workers.
 
     The parent process will receive the proctitle "zmq broker
     <fport>-<bport>", where "<fport> is the frontend port and "<bport>" is
     the backend port.
 
-  child_init_hook()
-    This hook binds a "REP" socket on the backend port, through which
-    workers communicate with the broker. Every child process receives the
-    proctitle "zmq worker <bport>", where "<bport>" is the backend port.
+  run_n_children( $n )
+    The same as in "Net::Server::PreFork", with all socket communication
+    code removed.
+
+  run_child()
+    Creates a "DEALER" socket between workers and server. Every child
+    process with get a proctitle of "zmq worker <bport>", where "<bport>" is
+    the backend port.
+
+    The child then signals the server that it is ready, and waits for
+    requests.
 
   accept()
     Waits for new messages from clients. When a message is received, it is
@@ -120,6 +179,9 @@ OVERRIDDEN METHODS
     Closes the children's socket and destroys the context (this is
     necessary, otherwise we'll have zombies).
 
+  delete_child( $pid )
+    Overridden to remove dealing with sockets.
+
 CONFIGURATION AND ENVIRONMENT
     Read Net::Server for more information about configuration.
 
@@ -128,7 +190,11 @@ DEPENDENCIES
 
     *   Carp
 
+    *   Getopt::Long
+
     *   Net::Server::PreFork
+
+    *   Pod::Usage
 
     *   ZMQ::FFI
 
@@ -162,6 +228,11 @@ SUPPORT
 
 AUTHOR
     Ido Perlmuter <ido@ido50.net>
+
+ACKNOWLEDGMENTS
+    In writing this module I relied heavily on Starman by Tatsuhiko
+    Miyagawa, and on code and information from the official ZeroMQ guide
+    <http://zguide.zeromq.org/>.
 
 LICENSE AND COPYRIGHT
     Copyright (c) 2015, Ido Perlmuter "ido@ido50.net".
