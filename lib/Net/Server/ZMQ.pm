@@ -5,13 +5,12 @@ package Net::Server::ZMQ;
 use warnings;
 use strict;
 use base 'Net::Server::PreFork';
-use constant READY => "\001";
 
 use Carp;
 use POSIX qw/WNOHANG/;
 use Net::Server::SIG qw/register_sig check_sigs/;
 use ZMQ::FFI;
-use ZMQ::FFI::Constants qw/ZMQ_ROUTER ZMQ_REQ/;
+use ZMQ::FFI::Constants qw/ZMQ_ROUTER ZMQ_DEALER/;
 
 our $VERSION = "1.000000";
 $VERSION = eval $VERSION;
@@ -139,6 +138,32 @@ sub post_configure {
 		unless ref $prop->{port} && ref $prop->{port} eq 'ARRAY' && scalar @{$prop->{port}} >= 2;
 }
 
+sub loop {
+	my $self = shift;
+	my $prop = $self->{server};
+
+	# get ready for children
+	$prop->{children} = {};
+	$prop->{reaped_children} = {};
+	if ($ENV{HUP_CHILDREN}) {
+		foreach my $line (split /\n/, $ENV{HUP_CHILDREN}) {
+			my ($pid, $status) = ($line =~ /^(\d+)\t(\w+)$/) ? ($1, $2) : next;
+			$prop->{children}->{$pid} = { status => $status, hup => 1 };
+		}
+	}
+
+	$prop->{tally} = {
+		time		=> time(),
+		waiting	=> scalar(grep { $_->{status} eq 'waiting' }    values %{$prop->{children}}),
+		processing	=> scalar(grep { $_->{status} eq 'processing' } values %{$prop->{children}}),
+		dequeue	=> scalar(grep { $_->{status} eq 'dequeue' }    values %{$prop->{children}})
+	};
+
+	$self->log(3, "Beginning prefork ($prop->{min_servers} processes)");
+	$self->run_n_children($prop->{min_servers});
+	$self->run_parent;
+}
+
 =head2 run_parent()
 
 Creates the broker process, binding a C<ROUTER> on the frontend port
@@ -154,14 +179,6 @@ where "<fport> is the frontend port and "<bport>" is the backend port.
 sub run_parent {
 	my $self = shift;
 	my $prop = $self->{server};
-
-	# This method is almost entirely copied from Net::Server::PreFork,
-	# which isn't a good thing, but necessary due to the usage of ZeroMQ
-	# sockets. The main difference is polling for events on the frontend
-	# and backend ports, and running the child-reading code only when
-	# backends are talking
-
-	my $read_fh = $prop->{'_READ'};
  
 	@{ $prop }{qw(last_checked_for_dead last_checked_for_waiting last_checked_for_dequeue last_process last_kill)} = (time) x 5;
 
@@ -183,7 +200,7 @@ sub run_parent {
 
 	$self->register_sig_pass;
 
-	if ($ENV{'HUP_CHILDREN'}) {
+	if ($ENV{HUP_CHILDREN}) {
 		while (defined(my $chld = waitpid(-1, WNOHANG))) {
 			last unless $chld > 0;
 			$self->{reaped_children}->{$chld} = 1;
@@ -217,60 +234,46 @@ sub run_parent {
 			my @msg = $f->recv_multipart;
 			$b->send_multipart([ pop(@workers), '', $msg[0], '', $msg[2] ]);
 		} elsif ($b->has_pollin) {
-			my @fh = $prop->{'child_select'}->can_read($prop->{'check_for_waiting'});
+			my @msg = $b->recv_multipart;
 
-			$self->idle_loop_hook(\@fh);
+			$w_addr = $msg[0];
+			$c_addr = $msg[2];
 
-			foreach my $fh (@fh) {
-				if ($fh != $read_fh) { # preforking server data
-					$self->child_is_talking_hook($fh);
-					next;
-				}
+			next unless defined $c_addr;
 
-				my $line = <$fh>;
-				next if ! defined $line;
+			if ($c_addr =~ m/^(?:waiting|processing|dequeue|exiting)$/) {
+				my ($pid) = ($w_addr =~ m/^child_(\d+)$/);
+				my $status = $c_addr;
 
-				last if $self->parent_read_hook($line); # optional test by user hook
+				push(@workers, $w_addr)
+					if $status eq 'waiting';
 
-				# child should say "$pid status\n"
-				next if $line !~ /^(\d+)\ +(waiting|processing|dequeue|exiting)$/;
-				my ($pid, $status) = ($1, $2);
+				$self->log(3, "$w_addr status $status");
 
-				if (my $child = $prop->{'children'}->{$pid}) {
+				if (my $child = $prop->{children}->{$pid}) {
 					if ($status eq 'exiting') {
 						$self->delete_child($pid);
 					} else {
 						# Decrement tally of state pid was in (plus sanity check)
-						my $old_status = $child->{'status'}    || $self->log(2, "No status for $pid when changing to $status");
-						--$prop->{'tally'}->{$old_status} >= 0 || $self->log(2, "Tally for $status < 0 changing pid $pid from $old_status to $status");
+						my $old_status = $child->{status}
+							|| $self->log(2, "No status for $pid when changing to $status");
 
-						$child->{'status'} = $status;
-						++$prop->{'tally'}->{$status};
+						--$prop->{tally}->{$old_status} >= 0
+							|| $self->log(2, "Tally for $status < 0 changing pid $pid from $old_status to $status");
 
-						$prop->{'last_process'} = time() if $status eq 'processing';
+						$child->{status} = $status;
+						++$prop->{tally}->{$status};
+
+						$prop->{last_process} = time()
+							if $status eq 'processing';
 					}
 				}
-			}
-
-			my @msg = $b->recv_multipart;
-
-			$w_addr = $msg[0];
-			push(@workers, $w_addr);
-
-			$delim = $msg[1];
-			$c_addr = $msg[2];
-
-			if ($c_addr ne READY) {
-				$delim = $msg[3];
-
-				$data = $msg[4];
-
-				$self->log(4, "$w_addr sending to $c_addr: $data");
-
-				$f->send_multipart([ $c_addr, '', $data ]);
 			} else {
-				$self->log(3, "$w_addr checking in");
+				$self->log(4, "$w_addr sending to $c_addr: $msg[4]");
+				$f->send_multipart([ $c_addr, '', $msg[4] ]);
 			}
+
+			#last if $self->parent_read_hook($c_addr); # optional test by user hook
 
 			$self->coordinate_children();
 		}
@@ -279,33 +282,97 @@ sub run_parent {
 	}
 }
 
-=head2 child_init_hook()
+sub run_n_children {
+	my ($self, $n) = @_;
+	my $prop = $self->{server};
 
-This hook binds a C<REP> socket on the backend port, through which
-workers communicate with the broker. Every child process receives the
-proctitle "zmq worker <bport>", where "<bport>" is the backend port.
+	return unless $n > 0;
 
-=cut
+	$self->run_n_children_hook($n);
 
-sub child_init_hook {
+	$self->log(3, "Starting \"$n\" children");
+	$prop->{last_start} = time();
+
+	for (1 .. $n) {
+		$self->pre_fork_hook;
+
+		local $!;
+
+		my $pid = fork;
+		if (!defined $pid) {
+			$self->fatal("Bad fork [$!]");
+		}
+
+		if ($pid) { # parent
+			$prop->{children}->{$pid}->{status} = 'waiting';
+			$prop->{tally}->{waiting}++;
+		} else { # child
+			$self->run_child;
+		}
+	}
+}
+
+sub run_child {
 	my $self = shift;
 	my $prop = $self->{server};
+
+	$SIG{'INT'} = $SIG{'TERM'} = $SIG{'QUIT'} = sub {
+		$self->child_finish_hook;
+		exit;
+	};
+	$SIG{'PIPE'} = 'IGNORE';
+	$SIG{'CHLD'} = 'DEFAULT';
+	$SIG{'HUP'}  = sub {
+		if (! $prop->{'connected'}) {
+			$self->child_finish_hook;
+			exit;
+		}
+		$prop->{'SigHUPed'} = 1;
+	};
+
+	$self->log(4, "Child Preforked ($$)");
+
+	delete @{ $prop }{qw(children tally last_start last_process)};
+
+	$self->child_init_hook;
 
 	my $port = $prop->{port}->[1];
 
 	$0 = "zmq worker $port";
 
 	my $ctx = ZMQ::FFI->new;
-	my $s = $ctx->socket(ZMQ_REQ);
+	my $s = $ctx->socket(ZMQ_DEALER);
 	$s->set_identity("child_$$");
 	$s->set_linger(0);
-
 	$s->connect("tcp://localhost:$port");
-
-	$s->send(READY);
 
 	$prop->{sock} = [$s];
 	$prop->{context} = $ctx;
+
+	$s->send_multipart([ '', 'waiting' ]);
+
+	while ($self->accept) {
+		$prop->{connected} = 1;
+
+		$s->send_multipart([ '', 'processing' ]);
+
+		my $ok = eval { $self->run_client_connection; 1 };
+		if (! $ok) {
+			$s->send_multipart([ '', 'exiting' ]);
+			die $@;
+		}
+
+		last if $self->done;
+
+		$prop->{connected} = 0;
+
+		$s->send_multipart([ '', 'waiting' ]);
+	}
+
+	$self->child_finish_hook;
+
+	$s->send_multipart([ '', 'exiting' ]);
+	exit;
 }
 
 =head2 accept()
@@ -330,11 +397,11 @@ sub accept {
 
 		my @msg = $sock->recv_multipart;
 
-		$self->log(4, $sock->get_identity." got: $msg[2]");
+		$self->log(4, $sock->get_identity." got: $msg[3]");
 
 		$prop->{client}	= $sock;
-		$prop->{peername}	= $msg[0];
-		$prop->{payload}	= $msg[2];
+		$prop->{peername}	= $msg[1];
+		$prop->{payload}	= $msg[3];
 
 		return 1;
 	}
@@ -372,6 +439,7 @@ sub process_request {
 	my $prop = $self->{server};
 
 	$prop->{client}->send_multipart([
+		'',
 		$prop->{peername},
 		'',
 		$prop->{app}->($prop->{payload})
@@ -432,6 +500,25 @@ sub child_finish_hook {
 		$prop->{sock}->[0]->close;
 		$prop->{context}->destroy;
 	};
+}
+
+sub delete_child {
+	my ($self, $pid) = @_;
+	my $prop = $self->{server};
+
+	my $child = $prop->{children}->{$pid};
+	if (! $child) {
+		$self->log(2, "Attempt to delete already deleted child $pid");
+		return;
+	}
+
+	return if ! exists $prop->{children}->{$pid}; # Already gone?
+
+	my $status = $child->{'status'}    || $self->log(2, "No status for $pid when deleting child");
+	--$prop->{'tally'}->{$status} >= 0 || $self->log(2, "Tally for $status < 0 deleting pid $pid");
+	$prop->{'tally'}->{'time'} = 0 if $child->{'hup'};
+
+	delete $prop->{'children'}->{$pid};
 }
 
 =head1 CONFIGURATION AND ENVIRONMENT
