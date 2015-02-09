@@ -16,3 +16,4 @@
 ^Net-Server-ZMQ-.*$
 ^\.build.*$
 ^MYMETA\..*$
+test.pl
