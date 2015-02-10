@@ -79,13 +79,7 @@ You get the full benefits of C<Net::Server::PreFork>, including the ability to i
 or decrease the number of workers at real-time by sending the C<TTIN> and C<TTOU> signals
 to the server, respectively.
 
-This is an early release, do not rely on it on production systems without thoroughly testing
-it beforehand.
-
-I plan to implement better reliability as described in the ZeroMQ guide in future versions,
-and also add support for different patterns such as publish-subscribe.
-
-The ZMQ server does not care about the format of messages passed between clients and workers,
+The created ZMQ server does not care about the format of messages passed between clients and workers,
 this kind of logic is left to the applications. You can easily implement a JSON-based job broker,
 for example, either by taking care of encoding/decoding in the worker code, or by extending this
 class and overriding C<process_request()>.
@@ -93,25 +87,33 @@ class and overriding C<process_request()>.
 Note that configuration of a ZMQ server requires two ports, one for the frontend (the port to
 which clients connect), and one for the backend (the port to which workers connect).
 
+=head2 STATUS
+
+This is an early release, do not rely on it on production systems without thoroughly testing
+it beforehand.
+
+I plan to implement better reliability as described in the ZeroMQ guide in future versions,
+and also add support for different patterns such as publish-subscribe.
+
 =head2 INTERNAL NOTES
 
 ZeroMQ has some different concepts regarding sockets, and as such this class overrides
 the bindings done by C<Net::Server> so they do nothing (C<pre_bind()>, C<bind()> and
 C<post_bind()> are emptied). Also, since ZeroMQ never exposes client information to request
-handlers, it is possible for C<Net::Server::ZMQ> to provide workers with data such as the
-IP address of the client, and the C<get_client_info()> method is empties as well. Supplying client
+handlers, it is impossible for C<Net::Server::ZMQ> to provide workers with data such as the
+IP address of the client, and the C<get_client_info()> method is emptied as well. Supplying client
 information should therefore be done applicatively. The C<allow_deny()> method is also
 overridden to always return true, for the same reason, though I'm not so certain yet
 whether a better solution can be implemented.
 
 Unfortunately, I did have to override quite a few methods I really didn't want to, such
 as C<loop()>, C<run_n_children()>, C<run_child()> and C<delete_child()>, mostly to get
-rid of any traditional socket communication between the child and parent processes and
+rid of any traditional socket communication between the child and parent processes, and
 replace it was ZeroMQ communication.
 
 =head2 CLIENT IMPLEMENTATION
 
-Clients should be implemented according to the L<lazy pirate client|http://zguide.zeromq.org/pl:lpclient>
+Clients should be implemented according to the L<lazy pirate pattern|http://zguide.zeromq.org/pl:lpclient>
 in the ZeroMQ guide. Clients I<MUST> define a unique identity on their sockets when communicating
 with the broker, otherwise the broker will not be able to direct responses from the workers back
 to the correct client.
